@@ -42,7 +42,7 @@ on:
         required: true
       part_size_mb:
         description: "分卷大小（MB），默认 2048（≈2GB）"
-        default: "2048"
+        default: "1900"
         required: true
 
 permissions:

@@ -1,0 +1,186 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# File: .github/workflows/copy-release-to-another-repo.yml
+# 用途：手动触发，把**当前仓库**的某个 Release（按 tag 指定）完整“复制/推送”到**目标仓库**：
+#       先把当前仓库的 Release 资产下载到本地，再上传到目标仓库对应的 Release。
+# 特性：
+#   - 支持覆盖同名资产（--clobber）
+#   - 目标 Release 不存在时自动创建（可设置 name/body/draft/prerelease/target）
+#   - 下载与上传全程顺序进行，失败重试
+# 前置：
+#   - Secrets：GH_PAT（PAT，至少 repo 权限；用于**目标仓库**操作）
+#   - 当前仓库读取可用 ${{ github.token }}（默认），无需额外配置
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Copy Release to Another Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_tag:
+        description: "源 Release 的 tag（当前仓库）"
+        required: true
+      dest_repo:
+        description: "目标仓库，格式 owner/repo"
+        required: true
+      dest_tag:
+        description: "目标 Release 的 tag（缺省=src_tag）"
+        required: false
+      dest_name:
+        description: "目标 Release 名称（缺省=dest_tag）"
+        required: false
+      dest_body:
+        description: "目标 Release 说明（可选，多行可）"
+        required: false
+      draft:
+        description: "是否创建为 Draft（true/false）"
+        default: "false"
+        required: true
+      prerelease:
+        description: "是否标记为 Pre-release（true/false）"
+        default: "false"
+        required: true
+      target:
+        description: "目标 Release 指向的提交/分支（可选）"
+        required: false
+      overwrite:
+        description: "上传时覆盖同名资产（true/false）"
+        default: "true"
+        required: true
+
+permissions:
+  contents: read   # 读取当前仓库 release（下载时仍可用）
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Install base deps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl ca-certificates unzip \
+            coreutils jq git
+
+      - name: Ensure gh CLI is available
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+          else
+            echo "gh not found, installing from official repo..."
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+            gh --version
+          fi
+
+      - name: Resolve inputs
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_TAG='${{ github.event.inputs.src_tag }}'
+          DEST_REPO='${{ github.event.inputs.dest_repo }}'
+          DEST_TAG='${{ github.event.inputs.dest_tag }}'
+          DEST_NAME='${{ github.event.inputs.dest_name }}'
+          DEST_BODY='${{ github.event.inputs.dest_body }}'
+          DRAFT='${{ github.event.inputs.draft }}'
+          PRERELEASE='${{ github.event.inputs.prerelease }}'
+          TARGET='${{ github.event.inputs.target }}'
+          OVERWRITE='${{ github.event.inputs.overwrite }}'
+
+          if [[ -z "$DEST_TAG" ]]; then DEST_TAG="$SRC_TAG"; fi
+          if [[ -z "$DEST_NAME" ]]; then DEST_NAME="$DEST_TAG"; fi
+
+          echo "src_tag=$SRC_TAG" >> $GITHUB_OUTPUT
+          echo "dest_repo=$DEST_REPO" >> $GITHUB_OUTPUT
+          echo "dest_tag=$DEST_TAG" >> $GITHUB_OUTPUT
+          echo "dest_name=$DEST_NAME" >> $GITHUB_OUTPUT
+          echo "dest_body<<BODYEOF" >> $GITHUB_OUTPUT
+          echo "$DEST_BODY" >> $GITHUB_OUTPUT
+          echo "BODYEOF" >> $GITHUB_OUTPUT
+          echo "draft=$DRAFT" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "overwrite=$OVERWRITE" >> $GITHUB_OUTPUT
+
+      - name: Download source release assets (from current repo)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SRC_TAG='${{ steps.vars.outputs.src_tag }}'
+          mkdir -p ./_release_assets
+          # 下载所有资产到本地目录
+          gh release download "$SRC_TAG" --dir ./_release_assets --repo "$GITHUB_REPOSITORY"
+          ls -lah ./_release_assets || true
+
+      - name: Ensure destination release exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DEST_REPO='${{ steps.vars.outputs.dest_repo }}'
+          DEST_TAG='${{ steps.vars.outputs.dest_tag }}'
+          DEST_NAME='${{ steps.vars.outputs.dest_name }}'
+          DEST_BODY='${{ steps.vars.outputs.dest_body }}'
+          DRAFT='${{ steps.vars.outputs.draft }}'
+          PRERELEASE='${{ steps.vars.outputs.prerelease }}'
+          TARGET='${{ steps.vars.outputs.target }}'
+
+          if ! gh release view "$DEST_TAG" --repo "$DEST_REPO" >/dev/null 2>&1; then
+            args=("$DEST_TAG" --repo "$DEST_REPO" --title "$DEST_NAME" --notes "$DEST_BODY")
+            [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
+            [[ "$DRAFT" == "true" ]] && args+=(--draft)
+            [[ "$PRERELEASE" == "true" ]] && args+=(--prerelease)
+            gh release create "${args[@]}"
+          fi
+
+      - name: Upload assets to destination release (sequential)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST_REPO='${{ steps.vars.outputs.dest_repo }}'
+          DEST_TAG='${{ steps.vars.outputs.dest_tag }}'
+          OVERWRITE='${{ steps.vars.outputs.overwrite }}'
+
+          cd ./_release_assets
+
+          retry() {
+            local n=0 max=3 delay=3
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then return 1; fi
+              echo "Retry $n/$max: $*" >&2
+              sleep $delay
+            done
+          }
+
+          shopt -s nullglob
+          files=(*)
+          if (( ${#files[@]} == 0 )); then
+            echo "No assets to upload (source release has no assets?)." >&2
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            echo "Uploading: $f"
+            if [[ "$OVERWRITE" == "true" ]]; then
+              retry gh release upload "$DEST_TAG" "$f" --repo "$DEST_REPO" --clobber
+            else
+              retry gh release upload "$DEST_TAG" "$f" --repo "$DEST_REPO"
+            fi
+          done
+
+          echo "All assets uploaded to $DEST_REPO@$DEST_TAG"
