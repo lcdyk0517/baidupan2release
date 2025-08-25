@@ -1,11 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # File: .github/workflows/baidupan-to-release.yml
-# 作用：手动触发，从百度网盘下载文件，若单个文件>2G则自动分卷，然后顺序上传到指定 Release。
+# 用途：手动触发；通过 BaiduPCS-Go + Cookie 从百度网盘按“逗号分隔的完整文件路径”
+#      逐个下载文件；单文件>阈值则分卷；每个文件完成后立即上传到 GitHub Release 并清理本地。
 # 说明：
-#  1) 使用 BaiduPCS-Go 并通过 Cookie 登录（只需提供 BAIDU_COOKIE）。
-#  2) 多个文件通过输入完整路径，使用英文逗号分隔，逐个处理（下载一个→上传一个→删除本地→再处理下一个）。
-#  3) Release 信息可在手动触发时填写（tag/name/body/draft/prerelease/target）。
-#  4) 需要在 repo 的 Secrets 中配置：BAIDU_COOKIE。
+#  1) 仅使用浏览器 Cookie 登录：仓库 Secrets 需要 BAIDU_COOKIE。
+#     建议包含：BDUSS、STOKEN、BAIDUID 等（示例：BDUSS=...; STOKEN=...; BAIDUID=...; PANWEB=1）。
+#  2) 多个文件用英文逗号分隔且必须是“文件路径”（不是目录）。
+#  3) 严格顺序：下载1个 →（必要时分卷）上传 → 删除本地 → 下一个。
+#  4) Release 信息（tag/name/body/draft/prerelease/target）手动触发时填写；tag 必填。
 # ──────────────────────────────────────────────────────────────────────────────
 
 name: BaiduPan → GitHub Release
@@ -35,11 +37,11 @@ on:
         required: false
       baidu_paths:
         description: |
-          需要下载的百度网盘“文件完整路径”，多个文件用英文逗号分隔。
-          示例：/我的资源/大文件1.iso,/我的资源/大文件2.zip
+          逗号分隔的“文件完整路径”（仅文件，非目录）。
+          示例：/我的资源/文件1.iso, /我的资源/文件2.zip
         required: true
       part_size_mb:
-        description: "分卷大小（MB），默认 2048（2GB 上限内留余量）"
+        description: "分卷大小（MB），默认 2048（≈2GB）"
         default: "2048"
         required: true
 
@@ -62,14 +64,27 @@ jobs:
             curl ca-certificates unzip p7zip-full \
             coreutils jq git
 
-      - name: Install gh CLI
-        uses: actions/setup-gh-cli@v2
+      - name: Ensure gh CLI is available
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+          else
+            echo "gh not found, installing from official repo..."
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+            gh --version
+          fi
 
       - name: Download BaiduPCS-Go (Linux amd64)
         shell: bash
         run: |
           set -euxo pipefail
-          VERSION="v3.9.0"
+          VERSION="v3.9.0"  # 可按需更新
           ARCHIVE="BaiduPCS-Go-${VERSION}-linux-amd64.zip"
           URL="https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/${VERSION}/${ARCHIVE}"
           curl -L "$URL" -o /tmp/bpcs.zip
@@ -87,7 +102,10 @@ jobs:
             echo "BAIDU_COOKIE is required. Please add it in repository Secrets." >&2
             exit 1
           fi
-          BaiduPCS-Go login -cookie "$BAIDU_COOKIE"
+          # 兼容不同分支：优先 -cookies，失败再退回 -cookie
+          if ! BaiduPCS-Go login -cookies "$BAIDU_COOKIE"; then
+            BaiduPCS-Go login -cookie "$BAIDU_COOKIE"
+          fi
           BaiduPCS-Go who
 
       - name: Create release if missing
@@ -113,27 +131,63 @@ jobs:
             gh release create "${args[@]}"
           fi
 
-      - name: Run downloader & uploader (sequential)
+      - name: Download each file → upload → delete (strict sequential)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          IFS=',' read -ra PATHS <<< "${{ github.event.inputs.baidu_paths }}"
+
+          # ---- Parse comma-separated file paths (trim spaces, skip empties) ----
+          RAW='${{ github.event.inputs.baidu_paths }}'
+          IFS=',' read -r -a PATHS <<< "$RAW"
+          cleaned=()
+          for p in "${PATHS[@]}"; do
+            p=$(echo "$p" | xargs)
+            [[ -z "$p" ]] && continue
+            cleaned+=("$p")
+          done
+          PATHS=("${cleaned[@]}")
+          if (( ${#PATHS[@]} == 0 )); then
+            echo "No valid file paths provided." >&2
+            exit 1
+          fi
+
           PART_SIZE_MB='${{ github.event.inputs.part_size_mb }}'
           TAG='${{ github.event.inputs.tag }}'
-
           workdir="$GITHUB_WORKSPACE/.baidu_cache"
           mkdir -p "$workdir"
 
+          # ---- helper: retry command up to 3 times ----
+          retry() {
+            local n=0 max=3 delay=3
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                return 1
+              fi
+              echo "Retry $n/$max: $*" >&2
+              sleep $delay
+            done
+          }
+
           for remote in "${PATHS[@]}"; do
+            echo "==> Processing: $remote"
             cd "$workdir"
-            echo "==> Downloading: $remote"
             rm -rf ./*
 
-            BaiduPCS-Go download -saveto . "$remote"
+            # Download only this file (no directory recursion)
+            if ! retry BaiduPCS-Go download -saveto . "$remote"; then
+              echo "    -> 下载失败（已重试）：$remote" >&2
+              continue
+            fi
 
             mapfile -t new_files < <(find . -maxdepth 1 -type f -printf '%P\n' | sort)
+            if (( ${#new_files[@]} == 0 )); then
+              echo "    -> 未找到文件（可能路径是目录或无权限）：$remote" >&2
+              continue
+            fi
+
             for f in "${new_files[@]}"; do
               [[ -f "$f" ]] || continue
               size_bytes=$(stat -c '%s' "$f")
@@ -141,7 +195,7 @@ jobs:
 
               max_bytes=$(( PART_SIZE_MB * 1024 * 1024 ))
               if (( size_bytes > max_bytes )); then
-                echo "    -> Split file into ${PART_SIZE_MB}MB parts"
+                echo "    -> Split into ${PART_SIZE_MB}MB parts"
                 prefix="${f}.part-"
                 split -b "${PART_SIZE_MB}m" -d -a 3 --additional-suffix=".bin" "$f" "$prefix"
                 echo "${f}" > "${f}.manifest"
@@ -149,15 +203,25 @@ jobs:
 
                 for p in ${prefix}*; do
                   echo "       uploading $p"
-                  gh release upload "$TAG" "$p" --clobber
+                  retry gh release upload "$TAG" "$p" --clobber || {
+                    echo "       -> 上传失败：$p" >&2
+                    exit 1
+                  }
                 done
-                gh release upload "$TAG" "${f}.manifest" --clobber
+                retry gh release upload "$TAG" "${f}.manifest" --clobber || {
+                  echo "       -> 上传 manifest 失败：${f}.manifest" >&2
+                  exit 1
+                }
               else
-                echo "    -> Uploading single file to release"
-                gh release upload "$TAG" "$f" --clobber
+                echo "    -> Uploading single file"
+                retry gh release upload "$TAG" "$f" --clobber || {
+                  echo "       -> 上传失败：$f" >&2
+                  exit 1
+                }
               fi
 
-              rm -f -- "$f"
+              # cleanup this file (keep workspace minimal)
+              rm -f -- "$f" || true
               rm -f -- ${f}.part-* 2>/dev/null || true
             done
 
