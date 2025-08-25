@@ -1,13 +1,13 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # File: .github/workflows/baidupan-to-release.yml
-# 用途：手动触发；通过 BaiduPCS-Go + Cookie 从百度网盘按“逗号分隔的完整文件路径”
-#      逐个下载文件；单文件>阈值则分卷；每个文件完成后立即上传到 GitHub Release 并清理本地。
+# 用途：手动触发；通过 BaiduPCS-Go（仅 Cookie 登录，Secrets: BAIDU_COOKIE）
+#      从百度网盘按“逗号分隔的完整**文件**路径”逐个下载；单文件>阈值则分卷；
+#      每个文件完成后立刻上传到 Release 并清理本地，再处理下一个。
 # 说明：
-#  1) 仅使用浏览器 Cookie 登录：仓库 Secrets 需要 BAIDU_COOKIE。
-#     建议包含：BDUSS、STOKEN、BAIDUID 等（示例：BDUSS=...; STOKEN=...; BAIDUID=...; PANWEB=1）。
-#  2) 多个文件用英文逗号分隔且必须是“文件路径”（不是目录）。
-#  3) 严格顺序：下载1个 →（必要时分卷）上传 → 删除本地 → 下一个。
-#  4) Release 信息（tag/name/body/draft/prerelease/target）手动触发时填写；tag 必填。
+#  1) 仅文件路径，不支持目录，不支持分享链接。
+#  2) 严格顺序：下载1个 →（必要时分卷）上传 → 删除本地 → 下一个。
+#  3) Release 信息（tag/name/body/draft/prerelease/target）运行时填写；tag 必填。
+#  4) 默认分卷阈值 2048MB（≈2GB）；可在触发时调整。
 # ──────────────────────────────────────────────────────────────────────────────
 
 name: BaiduPan → GitHub Release
@@ -35,10 +35,10 @@ on:
       target:
         description: "目标提交/分支（默认当前默认分支）"
         required: false
-      baidu_paths:
+      baidupan_files:
         description: |
           逗号分隔的“文件完整路径”（仅文件，非目录）。
-          示例：/我的资源/文件1.iso, /我的资源/文件2.zip
+          例：/我的资源/文件1.iso, /我的资源/文件2.zip
         required: true
       part_size_mb:
         description: "分卷大小（MB），默认 2048（≈2GB）"
@@ -55,7 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install base deps
         shell: bash
         run: |
           set -euxo pipefail
@@ -72,24 +72,34 @@ jobs:
             gh --version
           else
             echo "gh not found, installing from official repo..."
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
             sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+            echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
             sudo apt-get update
             sudo apt-get install -y gh
             gh --version
           fi
 
-      - name: Download BaiduPCS-Go (Linux amd64)
+      - name: Install BaiduPCS-Go
         shell: bash
         run: |
           set -euxo pipefail
-          VERSION="v3.9.0"  # 可按需更新
+          VERSION="v3.9.0"   # 可按需更新
           ARCHIVE="BaiduPCS-Go-${VERSION}-linux-amd64.zip"
           URL="https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/${VERSION}/${ARCHIVE}"
           curl -L "$URL" -o /tmp/bpcs.zip
+          mkdir -p /tmp/bpcs
           unzip -o /tmp/bpcs.zip -d /tmp/bpcs
-          sudo install -m 0755 /tmp/bpcs/BaiduPCS-Go /usr/local/bin/BaiduPCS-Go
+          # 自动定位二进制（考虑解压到子目录）
+          BPCS_BIN=$(find /tmp/bpcs -type f -name 'BaiduPCS-Go' | head -n1)
+          if [[ -z "${BPCS_BIN}" ]]; then
+            echo "BaiduPCS-Go binary not found in archive" >&2
+            find /tmp/bpcs -maxdepth 2 -type f -print || true
+            exit 1
+          fi
+          sudo install -m 0755 "${BPCS_BIN}" /usr/local/bin/BaiduPCS-Go
           BaiduPCS-Go -v
 
       - name: Login BaiduPCS-Go with Cookie
@@ -99,7 +109,7 @@ jobs:
         run: |
           set -euxo pipefail
           if [[ -z "${BAIDU_COOKIE:-}" ]]; then
-            echo "BAIDU_COOKIE is required. Please add it in repository Secrets." >&2
+            echo "BAIDU_COOKIE is required. Add it in repository Secrets." >&2
             exit 1
           fi
           # 兼容不同分支：优先 -cookies，失败再退回 -cookie
@@ -108,7 +118,7 @@ jobs:
           fi
           BaiduPCS-Go who
 
-      - name: Create release if missing
+      - name: Ensure/Create release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -131,15 +141,15 @@ jobs:
             gh release create "${args[@]}"
           fi
 
-      - name: Download each file → upload → delete (strict sequential)
+      - name: Download each → upload → delete (strict sequential)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # ---- Parse comma-separated file paths (trim spaces, skip empties) ----
-          RAW='${{ github.event.inputs.baidu_paths }}'
+          # 解析逗号分隔的文件路径，修剪空白并过滤空项
+          RAW='${{ github.event.inputs.baidupan_files }}'
           IFS=',' read -r -a PATHS <<< "$RAW"
           cleaned=()
           for p in "${PATHS[@]}"; do
@@ -158,14 +168,12 @@ jobs:
           workdir="$GITHUB_WORKSPACE/.baidu_cache"
           mkdir -p "$workdir"
 
-          # ---- helper: retry command up to 3 times ----
+          # 简单重试函数（最多 3 次）
           retry() {
             local n=0 max=3 delay=3
             until "$@"; do
               n=$((n+1))
-              if (( n >= max )); then
-                return 1
-              fi
+              if (( n >= max )); then return 1; fi
               echo "Retry $n/$max: $*" >&2
               sleep $delay
             done
@@ -176,19 +184,19 @@ jobs:
             cd "$workdir"
             rm -rf ./*
 
-            # Download only this file (no directory recursion)
+            # 仅下载此文件（不递归、不批量）
             if ! retry BaiduPCS-Go download -saveto . "$remote"; then
               echo "    -> 下载失败（已重试）：$remote" >&2
               continue
             fi
 
-            mapfile -t new_files < <(find . -maxdepth 1 -type f -printf '%P\n' | sort)
-            if (( ${#new_files[@]} == 0 )); then
-              echo "    -> 未找到文件（可能路径是目录或无权限）：$remote" >&2
+            mapfile -t files < <(find . -maxdepth 1 -type f -printf '%P\n' | sort)
+            if (( ${#files[@]} == 0 )); then
+              echo "    -> 未找到文件（可能给了目录或无权限）：$remote" >&2
               continue
             fi
 
-            for f in "${new_files[@]}"; do
+            for f in "${files[@]}"; do
               [[ -f "$f" ]] || continue
               size_bytes=$(stat -c '%s' "$f")
               echo "    -> Local file: $f ($size_bytes bytes)"
@@ -204,23 +212,20 @@ jobs:
                 for p in ${prefix}*; do
                   echo "       uploading $p"
                   retry gh release upload "$TAG" "$p" --clobber || {
-                    echo "       -> 上传失败：$p" >&2
-                    exit 1
+                    echo "       -> 上传失败：$p" >&2; exit 1;
                   }
                 done
                 retry gh release upload "$TAG" "${f}.manifest" --clobber || {
-                  echo "       -> 上传 manifest 失败：${f}.manifest" >&2
-                  exit 1
+                  echo "       -> 上传 manifest 失败：${f}.manifest" >&2; exit 1;
                 }
               else
                 echo "    -> Uploading single file"
                 retry gh release upload "$TAG" "$f" --clobber || {
-                  echo "       -> 上传失败：$f" >&2
-                  exit 1
+                  echo "       -> 上传失败：$f" >&2; exit 1;
                 }
               fi
 
-              # cleanup this file (keep workspace minimal)
+              # 立刻清理本地
               rm -f -- "$f" || true
               rm -f -- ${f}.part-* 2>/dev/null || true
             done
