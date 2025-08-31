@@ -198,36 +198,55 @@ jobs:
 
             for f in "${files[@]}"; do
               [[ -f "$f" ]] || continue
+              # 计算大小（去掉重复）
               size_bytes=$(stat -c '%s' "$f")
               echo "    -> Local file: $f ($size_bytes bytes)"
 
               max_bytes=$(( PART_SIZE_MB * 1024 * 1024 ))
-              if (( size_bytes > max_bytes )); then
-                echo "    -> Split into ${PART_SIZE_MB}MB parts"
-                prefix="${f}.part-"
-                split -b "${PART_SIZE_MB}m" -d -a 3 --additional-suffix=".bin" "$f" "$prefix"
-                echo "${f}" > "${f}.manifest"
-                echo "cat ${prefix}* > ${f} # reassemble" >> "${f}.manifest"
 
-                for p in ${prefix}*; do
-                  echo "       uploading $p"
+              if (( size_bytes > max_bytes )); then
+                echo "    -> 7-Zip 分卷成 ${PART_SIZE_MB}MB 的 .7z.001/.002/... "
+
+                # 压缩等级（镜像类建议 -mx=0）
+                COMPRESS_LEVEL="-mx=0"
+
+                # 目标 7z 基名
+                archive="${f}.7z"
+
+                # 分卷
+                7z a -t7z $COMPRESS_LEVEL -mmt=on -v"${PART_SIZE_MB}m" -- "$archive" "$f"
+
+                # 每个分卷校验
+                sha256sum "${archive}".0* > "${archive}.sha256.txt" || true
+
+                echo "       上传分卷……"
+                for p in "${archive}".0*; do
+                  echo "         -> $p"
                   retry gh release upload "$TAG" "$p" --clobber || {
                     echo "       -> 上传失败：$p" >&2; exit 1;
                   }
                 done
-                retry gh release upload "$TAG" "${f}.manifest" --clobber || {
-                  echo "       -> 上传 manifest 失败：${f}.manifest" >&2; exit 1;
-                }
+
+                # 上传校验
+                if [[ -f "${archive}.sha256.txt" ]]; then
+                  retry gh release upload "$TAG" "${archive}.sha256.txt" --clobber || {
+                    echo "       -> 上传校验失败：${archive}.sha256.txt" >&2; exit 1;
+                  }
+                fi
+
+                # 清理仅在分卷分支里做
+                rm -f -- "${archive}".0* 2>/dev/null || true
+                rm -f -- "${archive}.sha256.txt" 2>/dev/null || true
+
               else
-                echo "    -> Uploading single file"
+                echo "    -> 文件未超过阈值，直接上传原文件（或改为打包成单一 .7z 再传也可）"
                 retry gh release upload "$TAG" "$f" --clobber || {
                   echo "       -> 上传失败：$f" >&2; exit 1;
                 }
               fi
 
-              # 立刻清理本地
+              # 无论哪条分支，最后都清理原文件
               rm -f -- "$f" || true
-              rm -f -- ${f}.part-* 2>/dev/null || true
             done
 
             find . -maxdepth 1 -type f -name "._*" -delete || true
