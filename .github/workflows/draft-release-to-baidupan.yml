@@ -1,0 +1,257 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# File: .github/workflows/draft-release-to-baidupan.yml
+# 用途：手动触发；下载指定 GitHub 仓库的某个 Release（包括 Draft）的所有资产，
+#      若存在分卷（.001/.002/...）则先解压再上传到百度网盘指定目录。
+# 特性：
+#   - 支持 Draft Release（需提供 PAT，因为 draft 不公开可见）
+#   - 支持 latest（默认）
+# 前置：
+#   - Secrets: BAIDU_COOKIE（百度网盘 Cookie 登录）
+#   - Secrets: GH_PAT（可选，用于访问 Draft Release）
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Draft Release → 百度网盘
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_repo:
+        description: "源仓库（owner/repo 格式）"
+        required: true
+        default: "lcdyk0517/arkos4clone"
+      release_type:
+        description: "获取方式"
+        required: true
+        default: "draft"
+        type: choice
+        options:
+          - draft
+          - latest
+          - tag
+      tag:
+        description: "Release tag（仅 release_type=tag 时必填）"
+        required: false
+      dest_dir:
+        description: "百度网盘目标根目录"
+        required: true
+        default: "/lcdyk有的掌机/魔改包/arkos4clone"
+
+permissions:
+  contents: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install base deps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl ca-certificates jq p7zip-full
+
+      - name: Install BaiduPCS-Go
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VERSION="v4.0.1"
+          ARCHIVE="BaiduPCS-Go-${VERSION}-linux-amd64.zip"
+          URL="https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/${VERSION}/${ARCHIVE}"
+          curl -L "$URL" -o /tmp/bpcs.zip
+          mkdir -p /tmp/bpcs
+          unzip -o /tmp/bpcs.zip -d /tmp/bpcs
+          BPCS_BIN=$(find /tmp/bpcs -type f -name 'BaiduPCS-Go' | head -n1)
+          if [[ -z "${BPCS_BIN}" ]]; then
+            echo "BaiduPCS-Go binary not found" >&2
+            exit 1
+          fi
+          sudo install -m 0755 "${BPCS_BIN}" /usr/local/bin/BaiduPCS-Go
+          BaiduPCS-Go -v
+
+      - name: Login BaiduPCS-Go with Cookie
+        env:
+          BAIDU_COOKIE: ${{ secrets.BAIDU_COOKIE }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ -z "${BAIDU_COOKIE:-}" ]]; then
+            echo "BAIDU_COOKIE is required." >&2
+            exit 1
+          fi
+          if ! BaiduPCS-Go login -cookies "$BAIDU_COOKIE"; then
+            BaiduPCS-Go login -cookie "$BAIDU_COOKIE"
+          fi
+          BaiduPCS-Go who
+
+      - name: Fetch release info
+        id: release
+        env:
+          SRC_REPO: ${{ github.event.inputs.src_repo }}
+          RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$RELEASE_TYPE" in
+            latest)
+              echo "Fetching latest release"
+              RELEASE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${SRC_REPO}/releases/latest")
+              ;;
+            tag)
+              if [[ -z "$TAG" ]]; then
+                echo "ERROR: tag is required when release_type=tag" >&2
+                exit 1
+              fi
+              echo "Fetching release by tag: $TAG"
+              RELEASE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${SRC_REPO}/releases/tags/${TAG}")
+              ;;
+            draft)
+              echo "Fetching latest draft release from list"
+              # Draft 不在 latest 端点，需从列表获取
+              RELEASES=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${SRC_REPO}/releases?per_page=30")
+              RELEASE=$(echo "$RELEASES" | jq -c '[.[] | select(.draft==true)] | first // empty')
+              if [[ -z "$RELEASE" || "$RELEASE" == "null" ]]; then
+                echo "ERROR: No draft release found" >&2
+                exit 1
+              fi
+              ;;
+          esac
+
+          MESSAGE=$(echo "$RELEASE" | jq -r '.message // empty')
+          if [[ -n "$MESSAGE" ]]; then
+            echo "ERROR: $MESSAGE" >&2
+            exit 1
+          fi
+
+          TAG_NAME=$(echo "$RELEASE" | jq -r '.tag_name')
+          NAME=$(echo "$RELEASE" | jq -r '.name // empty')
+          IS_DRAFT=$(echo "$RELEASE" | jq -r '.draft')
+          [[ -z "$NAME" ]] && NAME="$TAG_NAME"
+
+          echo "Release: $NAME (tag: $TAG_NAME, draft: $IS_DRAFT)"
+
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+          COUNT=$(echo "$RELEASE" | jq '.assets | length')
+          echo "Found $COUNT assets"
+
+          echo "$RELEASE" | jq -r '.assets[] | "\(.id)\t\(.name)\t\(.size)"' > /tmp/assets.txt
+          cat /tmp/assets.txt
+
+          echo "assets<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/assets.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Download, extract and upload to Baidu Pan
+        env:
+          DEST_DIR: ${{ github.event.inputs.dest_dir }}
+          RELEASE_NAME: ${{ steps.release.outputs.name }}
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REMOTE_DIR="${DEST_DIR}/${RELEASE_NAME}"
+          echo "Target dir: $REMOTE_DIR"
+
+          IFS='/' read -ra DIR_PARTS <<< "$REMOTE_DIR"
+          CURRENT=""
+          for part in "${DIR_PARTS[@]}"; do
+            [[ -z "$part" ]] && CURRENT="/" && continue
+            CURRENT="${CURRENT}/${part}"
+            echo "  mkdir: $CURRENT"
+            BaiduPCS-Go mkdir "$CURRENT" || true
+          done
+          echo "  Verify: $(BaiduPCS-Go ls "$REMOTE_DIR" 2>&1 | head -1)"
+
+          workdir="$GITHUB_WORKSPACE/.dl_cache"
+          mkdir -p "$workdir"
+          cd "$workdir"
+
+          retry() {
+            local n=0 max=3 delay=5
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then return 1; fi
+              echo "Retry $n/$max: $*" >&2
+              sleep $delay
+            done
+          }
+
+          echo "=== Step 1: Download all assets ==="
+          SRC_REPO='${{ github.event.inputs.src_repo }}'
+          TOTAL=$(wc -l < /tmp/assets.txt)
+          IDX=0
+          while IFS=$'\t' read -r ASSET_ID FILENAME SIZE; do
+            IDX=$((IDX+1))
+            SIZE_MB=$((SIZE / 1024 / 1024))
+            echo "==> [$IDX/$TOTAL] Downloading: $FILENAME (${SIZE_MB}MB)"
+            rm -f -- "$FILENAME"
+            # Draft 资产必须通过 API 端点 + Accept header 下载
+            if ! retry curl -L --progress-bar \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "$FILENAME" \
+              "https://api.github.com/repos/${SRC_REPO}/releases/assets/${ASSET_ID}"; then
+              echo "    Download failed: $FILENAME" >&2
+              exit 1
+            fi
+            echo "    OK: $FILENAME ($(stat -c '%s' "$FILENAME" | awk '{printf "%.0fMB", $1/1024/1024}'))"
+          done < /tmp/assets.txt
+
+          echo ""
+          echo "=== Step 2: Detect and extract split archives ==="
+
+          upload_files=()
+          has_split=false
+
+          for first_part in *.001; do
+            [[ -f "$first_part" ]] || continue
+            has_split=true
+            base="${first_part%.001}"
+            echo "  Split group: $base"
+            echo "  Extracting from $first_part ..."
+            rm -rf /tmp/extract_out
+            if ! 7z x -y "$first_part" -o/tmp/extract_out; then
+              echo "  ERROR: 7z extraction failed for $base" >&2
+              exit 1
+            fi
+            while IFS= read -r ef; do
+              upload_files+=("$ef")
+              echo "  Extracted: $(basename "$ef")"
+            done < <(find /tmp/extract_out -maxdepth 1 -type f -printf '%p\n' | sort)
+          done
+
+          for f in *; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" =~ \.0[0-9]{2,}$ ]] && continue
+            upload_files+=("$workdir/$f")
+          done
+
+          echo ""
+          echo "=== Step 3: Upload to Baidu Pan ==="
+          echo "  Files to upload: ${#upload_files[@]}"
+          for f in "${upload_files[@]}"; do
+            size_mb=$(stat -c '%s' "$f" 2>/dev/null | awk '{printf "%.0f", $1/1024/1024}')
+            echo "  Uploading: $f (${size_mb}MB)"
+            if ! retry BaiduPCS-Go upload --norapid --policy overwrite "$f" "$REMOTE_DIR/"; then
+              echo "  ERROR: Upload failed: $f" >&2
+              exit 1
+            fi
+            echo "  OK: $f"
+            rm -f -- "$f"
+          done
+
+          rm -rf /tmp/extract_out
+
+          echo ""
+          echo "=== Done ==="
+          echo "All files uploaded to $REMOTE_DIR"
+          BaiduPCS-Go ls "$REMOTE_DIR"
